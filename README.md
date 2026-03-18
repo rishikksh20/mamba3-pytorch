@@ -198,3 +198,10 @@ Runs SISO and MIMO forward passes, single-step decode, shape assertions, and a p
 torch
 einops
 ```
+
+---
+
+## References
+
+- **Paper:** Lahoti et al., *Mamba-3: Improved Sequence Modeling using State Space Principles*, 2026. [arXiv:2603.15569](https://arxiv.org/abs/2603.15569)
+- **Official implementation:** [state-spaces/mamba](https://github.com/state-spaces/mamba/tree/main) — production code with Triton/CUDA/TileLang kernels
