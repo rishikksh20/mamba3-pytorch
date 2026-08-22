@@ -35,6 +35,53 @@ Imagine you are reading a 500-page mystery novel.
 * **The Solution:** Mamba-3 switches from a **SISO** (Single-Input, Single-Output) to a **MIMO** (Multi-Input, Multi-Output) approach. [cite_start]This changes the state update from a simple "outer product" to a full "matrix multiplication"[cite: 33, 479].
 * **Benefit:** It "overlays" more computation onto the same amount of memory movement. [cite_start]In simple terms, it gives the model more "brain power" during each step without actually making the user wait longer for the text to appear[cite: 35, 134, 489].
 
+##### MIMO tensor invariant and implementation correction
+
+The persistent hidden state keeps the per-head feature dimension in both modes:
+
+```text
+SISO state: (B, H, P, D)
+MIMO state: (B, H, P, D)
+```
+
+MIMO adds a transient rank dimension `R` to the write/read paths, not to the
+persistent state. With the layout used in `mamba3.py`:
+
+```text
+B_t, C_t:       (B, R, H, D)
+X_t, Z_t, Y_t:  (B, R, H, P)
+state:           (B, H, P, D)
+```
+
+The lightweight `mimo_x` projection expands each feature of `x` across `R`;
+it must not contract the entire `P` axis into `R` scalars. The write is:
+
+```python
+X_t = torch.einsum("bhp,hrp->brhp", x_t, mimo_x)
+write_t = torch.einsum("brhp,brhd->bhpd", X_t, B_t)
+```
+
+Equivalently, per batch and head this is the rank-`R` matrix product
+`X_t @ B_t.T`, producing a `P × D` update. After the recurrent update, `C_t`
+reads `R` outputs of shape `P`; the output gate is applied per rank, and only
+then is `R` reduced:
+
+```python
+Y_t = torch.einsum("brhd,bhpd->brhp", C_t, state)
+Z_t = torch.einsum("bhp,hrp->brhp", z_t, mimo_z)
+y_t = torch.einsum(
+    "brhp,hrp->bhp",
+    (Y_t + D.view(1, 1, H, 1) * X_t) * F.silu(Z_t),
+    mimo_o,
+)
+```
+
+This is why MIMO raises arithmetic intensity without multiplying recurrent
+state traffic: `R` makes the write/read richer while the cached state remains
+`P × D`. The official implementation likewise allocates `ssm_state` as
+`(batch, nheads, headdim, d_state)` for both SISO and MIMO; see the
+[official cache allocation](https://github.com/state-spaces/mamba/blob/main/mamba_ssm/modules/mamba3.py#L412-L449).
+
 
 #### 4. Empirical Performance Gains
 * [cite_start]**Smartness:** At the 1.5B parameter scale, Mamba-3 (MIMO) outperformed Transformers by **2.2 percentage points** and Mamba-2 by **1.9 points** on downstream language tasks[cite: 485].

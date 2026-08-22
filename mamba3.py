@@ -217,53 +217,56 @@ def mamba3_siso_scan(
 
 def mamba3_mimo_scan(
     x: torch.Tensor,       # (B, L, H, P)    — input values
+    z: torch.Tensor,       # (B, L, H, P)    — output gate
     B_proj: torch.Tensor,  # (B, L, R, H, D) — K projections (R rank copies)
     C_proj: torch.Tensor,  # (B, L, R, H, D) — Q projections (R rank copies)
     ADT: torch.Tensor,     # (B, L, H)       — log decay
     DT: torch.Tensor,      # (B, L, H)       — time step
     trap: torch.Tensor,    # (B, L, H)       — trapezoidal gate
     D_skip: torch.Tensor,  # (H,)            — skip weight
-    mimo_x: torch.Tensor,  # (H, R, P)       — MIMO down-project for x
-    mimo_o: torch.Tensor,  # (H, R, P)       — MIMO up-project for output
+    mimo_x: torch.Tensor,  # (H, R, P)       — expand x over MIMO rank
+    mimo_z: torch.Tensor,  # (H, R, P)       — expand z over MIMO rank
+    mimo_o: torch.Tensor,  # (H, R, P)       — reduce MIMO rank in output
 ) -> torch.Tensor:
     """MIMO variant of the Mamba-3 SSM scan.
 
-    MIMO replaces the full outer-product state (P×D) used in SISO with a
-    lower-dimensional shared state (D) updated by R rank-1 contributions.
-    This trades the per-token outer product (P×D write) for a sum of R
-    scalar-times-vector terms — the key hardware-efficiency win.
+    MIMO preserves the full P×D recurrent state used by SISO. It expands the
+    value, key, and query paths over a small rank R so that the state write is
+    a rank-R matrix multiplication instead of a rank-1 outer product. The
+    persistent state does not contain R, so MIMO increases useful arithmetic
+    without increasing the dominant recurrent-state memory traffic.
 
     Shapes:
         SISO state h: (B, H, P, D)  — headdim × d_state
-        MIMO state h: (B, H, D)     — just d_state (P is projected away)
+        MIMO state h: (B, H, P, D)  — same persistent state shape
 
     State update per timestep t:
-        x_r   = einsum("bhp,hrp->bhr", x_t, mimo_x)  # project x to R scalars per head
-        Bx_t  = einsum("bhr,brhd->bhd", x_r, B_t)    # sum of R outer contributions → (B,H,D)
-        h_t   = exp(A·dt) * h_{t-1} + dt * blend(Bx_t, Bx_prev)  # scalar * D-vec
+        X_t   = einsum("bhp,hrp->brhp", x_t, mimo_x)  # (B,R,H,P)
+        Bx_t  = einsum("brhd,brhp->bhpd", B_t, X_t)   # rank-R write → (B,H,P,D)
+        h_t   = exp(A·dt) * h_{t-1} + dt * blend(Bx_t, Bx_prev)
 
     Output update per timestep t:
-        y_r   = einsum("brhd,bhd->brh", C_t, h_t)    # R scalars per head (B, R, H)
-        skip  = D * x_r                                # skip connection (B, H, R)
-        y_t   = einsum("brh,hrp->bhp", y_r+skip, mimo_o)  # up-project to headdim
+        Y_t   = einsum("brhd,bhpd->brhp", C_t, h_t)   # (B,R,H,P)
+        Z_t   = einsum("bhp,hrp->brhp", z_t, mimo_z)  # rank-wise gate
+        y_t   = einsum("brhp,hrp->bhp", (Y_t + D*X_t) * silu(Z_t), mimo_o)
 
     Returns:
         y: (B, L, H, P)
     """
     B_batch, L, H, P = x.shape
-    R = B_proj.shape[2]
     D_state = B_proj.shape[-1]
     device = x.device
     dtype = x.dtype
 
-    # MIMO state is just D-dimensional (no P dimension — P is projected away)
-    h      = torch.zeros(B_batch, H, D_state, device=device, dtype=torch.float32)
-    Bx_prev = torch.zeros(B_batch, H, D_state, device=device, dtype=torch.float32)
+    # R is transient; the persistent state keeps the same P×D layout as SISO.
+    h = torch.zeros(B_batch, H, P, D_state, device=device, dtype=torch.float32)
+    Bx_prev = torch.zeros(B_batch, H, P, D_state, device=device, dtype=torch.float32)
 
     ys = []
 
     for t in range(L):
         x_t   = x[:, t]      # (B, H, P)
+        z_t   = z[:, t]      # (B, H, P)
         B_t   = B_proj[:, t] # (B, R, H, D)
         C_t   = C_proj[:, t] # (B, R, H, D)
         adt_t = ADT[:, t]    # (B, H)
@@ -274,36 +277,36 @@ def mamba3_mimo_scan(
         dt_e  = dt_t               # (B, H)
         tr_e  = tr_t               # (B, H)
 
-        # ── Down-project x from headdim P to R rank-scalars per head ──────────
-        # x_r[b, h, r] = dot(x_t[b, h, :], mimo_x[h, r, :])  — scalar per head per rank
-        x_r = torch.einsum("bhp,hrp->bhr", x_t.float(), mimo_x.float())  # (B, H, R)
+        # ── Expand each P feature over the MIMO rank ─────────────────────────
+        # The repeated p label keeps P in the result; mimo_x scales each
+        # feature/rank pair rather than contracting P away.
+        x_r = torch.einsum("bhp,hrp->brhp", x_t.float(), mimo_x.float())  # (B, R, H, P)
 
-        # ── Accumulate state contribution across all R ranks ──────────────────
-        # For rank r: contribution = x_r[b,h,r] * B_t[b,r,h,:]  — (B, H, D)
-        # Bx_curr = sum_r contribution                              — (B, H, D)
-        Bx_curr = torch.einsum("bhr,brhd->bhd", x_r, B_t.float())  # (B, H, D)
+        # ── Rank-R matrix write into the persistent P×D state ────────────────
+        # Bx_curr[b,h,p,d] = sum_r x_r[b,r,h,p] * B_t[b,r,h,d]
+        Bx_curr = torch.einsum("brhp,brhd->bhpd", x_r, B_t.float())  # (B, H, P, D)
 
         # ── Trapezoidal blend ─────────────────────────────────────────────────
         # trap=0 → pure current (Euler); trap=1 → average current+previous (trapezoid)
-        tr_e3 = tr_e.unsqueeze(-1)            # (B, H, 1)
-        Bx_blended = (1.0 - tr_e3) * Bx_curr + tr_e3 * 0.5 * (Bx_curr + Bx_prev)
+        tr_e4 = tr_e.unsqueeze(-1).unsqueeze(-1)  # (B, H, 1, 1)
+        Bx_blended = (1.0 - tr_e4) * Bx_curr + tr_e4 * 0.5 * (Bx_curr + Bx_prev)
 
-        # ── State update: scalar multiply (no P dim needed) ───────────────────
-        # h: (B, H, D);  decay and dt_e: (B, H) — unsqueeze for broadcast
-        h = decay.unsqueeze(-1) * h + dt_e.unsqueeze(-1) * Bx_blended  # (B, H, D)
+        # ── State update; R has been reduced but P remains persistent ────────
+        h = (
+            decay.unsqueeze(-1).unsqueeze(-1) * h
+            + dt_e.unsqueeze(-1).unsqueeze(-1) * Bx_blended
+        )  # (B, H, P, D)
 
-        # ── Per-rank output scalar (before up-projection) ─────────────────────
-        # y_r[b, r, h] = dot(C_t[b, r, h, :], h[b, h, :])  — scalar per rank per head
-        y_r_scalar = torch.einsum("brhd,bhd->brh", C_t.float(), h)  # (B, R, H)
+        # ── Read R P-dimensional outputs from the shared P×D state ──────────
+        y_r = torch.einsum("brhd,bhpd->brhp", C_t.float(), h)  # (B, R, H, P)
 
-        # ── D skip connection (per rank scalar) ──────────────────────────────
-        # skip[b, r, h] = D[h] * x_r[b, h, r]
-        skip = D_skip.unsqueeze(0).unsqueeze(0) * x_r.permute(0, 2, 1)  # (B, R, H)
+        # The skip and gate are rank-wise and retain P until the final reduction.
+        skip = D_skip.view(1, 1, H, 1) * x_r                  # (B, R, H, P)
+        z_r = torch.einsum("bhp,hrp->brhp", z_t.float(), mimo_z.float())
+        y_r = (y_r + skip) * F.silu(z_r)
 
-        # ── Up-project combined output to headdim P ───────────────────────────
-        # y_t[b, h, p] = sum_r (y_r_scalar[b,r,h] + skip[b,r,h]) * mimo_o[h, r, p]
-        y_pre = y_r_scalar + skip                                      # (B, R, H)
-        y_t   = torch.einsum("brh,hrp->bhp", y_pre, mimo_o.float())   # (B, H, P)
+        # Reduce only R; the per-head feature dimension P is preserved.
+        y_t = torch.einsum("brhp,hrp->bhp", y_r, mimo_o.float())  # (B, H, P)
 
         ys.append(y_t.to(dtype))
         Bx_prev = Bx_curr  # update trapezoidal memory
@@ -432,10 +435,10 @@ class Mamba3(nn.Module):
         self.C_norm = RMSNorm(d_state)
 
         # ── MIMO projection matrices ─────────────────────────────────────────
-        # mimo_x: projects x (headdim-dim) down to R scalar values per head
-        # mimo_o: projects R scalar values back up to headdim per head
-        # mimo_z: same down-projection for the gate z (used in output norm)
-        # Initialized to 1/R so that the sum over ranks is approximately 1x.
+        # mimo_x / mimo_z expand each headdim feature over R streams using
+        # feature-wise scaling; they do not contract away P. mimo_o reduces R
+        # after the rank-wise state read and output gate. Initialized so that
+        # the sum over ranks is approximately 1x.
         if self.is_mimo:
             self.mimo_x = nn.Parameter(
                 torch.ones(self.nheads, self.mimo_rank, self.headdim, **factory_kwargs) / self.mimo_rank
@@ -558,9 +561,10 @@ class Mamba3(nn.Module):
 
         # ── Step 7: SSM scan ─────────────────────────────────────────────────
         if self.is_mimo:
-            # MIMO: state is (B, H, D) — P dimension is projected away via mimo_x
+            # MIMO: R enriches the write/read while state stays (B, H, P, D).
             y = mamba3_mimo_scan(
                 x=x,
+                z=z,
                 B_proj=B_proj,   # (B, L, R, H, D)
                 C_proj=C_proj,
                 ADT=ADT,
@@ -568,10 +572,9 @@ class Mamba3(nn.Module):
                 trap=trap,
                 D_skip=self.D,
                 mimo_x=self.mimo_x,
+                mimo_z=self.mimo_z,
                 mimo_o=self.mimo_o,
             )
-            # Gate output with z using simple SiLU (matches non-outproj_norm path)
-            y = y * F.silu(z.float())
         else:
             # SISO: squeeze out the R=1 rank dimension for the scan
             y = mamba3_siso_scan(
@@ -643,7 +646,8 @@ class Mamba3(nn.Module):
         C_raw = rearrange(C_raw, "b (r g n) -> b r g n",
                           r=self.mimo_rank, g=self.num_bc_heads)
 
-        A   = -F.softplus(dd_A.float()).clamp(max=-self.A_floor)  # (B, H)
+        A   = -F.softplus(dd_A.float())                            # (B, H)
+        A   = A.clamp(max=-self.A_floor)
         DT  = F.softplus(dd_dt.float() + self.dt_bias)            # (B, H)
         ADT = A * DT                                               # (B, H)
         trap = torch.sigmoid(trap_raw.float())                     # (B, H)
@@ -679,22 +683,35 @@ class Mamba3(nn.Module):
         tr    = trap             # (B, H)
 
         if self.is_mimo:
-            # MIMO state: (B, H, D)  — x projected to R scalars, not full P-dim outer product
-            x_r = torch.einsum("bhp,hrp->bhr", x.float(), self.mimo_x.float())  # (B, H, R)
+            # Expand x over R without contracting P: (B, R, H, P).
+            x_r = torch.einsum(
+                "bhp,hrp->brhp", x.float(), self.mimo_x.float()
+            )
 
-            # Sum of rank-1 contributions: Bx_curr[b,h,d] = sum_r x_r[b,h,r] * B_proj[b,r,h,d]
-            Bx_curr = torch.einsum("bhr,brhd->bhd", x_r, B_proj.float())  # (B, H, D)
+            # Rank-R matrix write; R is reduced and P remains in the state.
+            Bx_curr = torch.einsum(
+                "brhp,brhd->bhpd", x_r, B_proj.float()
+            )  # (B, H, P, D)
 
-            tr_e = tr.unsqueeze(-1)                             # (B, H, 1)
+            tr_e = tr.unsqueeze(-1).unsqueeze(-1)               # (B, H, 1, 1)
             Bx_blended = (1.0 - tr_e) * Bx_curr + tr_e * 0.5 * (Bx_curr + Bx_prev_state)
-            ssm_state  = decay.unsqueeze(-1) * ssm_state + DT.unsqueeze(-1) * Bx_blended  # (B, H, D)
+            ssm_state = (
+                decay.unsqueeze(-1).unsqueeze(-1) * ssm_state
+                + DT.unsqueeze(-1).unsqueeze(-1) * Bx_blended
+            )  # (B, H, P, D)
 
-            # Per-rank output scalars then up-project
-            y_r_scalar = torch.einsum("brhd,bhd->brh", C_proj.float(), ssm_state)  # (B, R, H)
-            skip       = self.D.unsqueeze(0).unsqueeze(0) * x_r.permute(0, 2, 1)  # (B, R, H)
-            y_pre      = y_r_scalar + skip                                          # (B, R, H)
-            y          = torch.einsum("brh,hrp->bhp", y_pre, self.mimo_o.float())  # (B, H, P)
-            y          = y * F.silu(z.float())
+            # Read and gate each rank before reducing R back to P.
+            y_r = torch.einsum(
+                "brhd,bhpd->brhp", C_proj.float(), ssm_state
+            )  # (B, R, H, P)
+            skip = self.D.view(1, 1, self.nheads, 1) * x_r
+            z_r = torch.einsum(
+                "bhp,hrp->brhp", z.float(), self.mimo_z.float()
+            )
+            y_r = (y_r + skip) * F.silu(z_r)
+            y = torch.einsum(
+                "brhp,hrp->bhp", y_r, self.mimo_o.float()
+            )  # (B, H, P)
 
             Bx_prev_state = Bx_curr
         else:
@@ -721,17 +738,18 @@ class Mamba3(nn.Module):
     def allocate_inference_cache(self, batch_size: int, device=None, dtype=None):
         """Allocate zero-initialized states for autoregressive inference.
 
-        State shapes differ between SISO and MIMO:
-          SISO: ssm_state is (batch, H, P, D) — full headdim × d_state outer-product state
-          MIMO: ssm_state is (batch, H, D)    — shared D-dimensional state (P projected away)
+        SISO and MIMO use the same persistent state shape:
+          ssm_state is (batch, H, P, D) — headdim × d_state matrix state.
 
-        Both modes share the same Bx_prev_state shape as ssm_state
-        (trapezoidal integration memory).
+        MIMO rank R is transient and is reduced by the state write, so it is
+        not an inference-cache dimension. Bx_prev_state has the same shape as
+        ssm_state because this clarity-first implementation caches the previous
+        materialized write for trapezoidal integration.
 
         Returns:
-            angle_state:   (batch, H, num_rope_angles)    — float32
-            ssm_state:     (batch, H, P, D) or (batch, H, D)
-            Bx_prev_state: same shape as ssm_state
+            angle_state:   (batch, H, num_rope_angles) — float32
+            ssm_state:     (batch, H, P, D)            — float32
+            Bx_prev_state: (batch, H, P, D)            — float32
         """
         device = device or self.in_proj.weight.device
 
@@ -739,26 +757,14 @@ class Mamba3(nn.Module):
             batch_size, self.nheads, self.num_rope_angles,
             device=device, dtype=torch.float32,
         )
-        if self.is_mimo:
-            # MIMO: state has no P (headdim) dimension — x is projected to R scalars
-            ssm_state = torch.zeros(
-                batch_size, self.nheads, self.d_state,
-                device=device, dtype=torch.float32,
-            )
-            Bx_prev_state = torch.zeros(
-                batch_size, self.nheads, self.d_state,
-                device=device, dtype=torch.float32,
-            )
-        else:
-            # SISO: state is full outer product (headdim × d_state)
-            ssm_state = torch.zeros(
-                batch_size, self.nheads, self.headdim, self.d_state,
-                device=device, dtype=torch.float32,
-            )
-            Bx_prev_state = torch.zeros(
-                batch_size, self.nheads, self.headdim, self.d_state,
-                device=device, dtype=torch.float32,
-            )
+        ssm_state = torch.zeros(
+            batch_size, self.nheads, self.headdim, self.d_state,
+            device=device, dtype=torch.float32,
+        )
+        Bx_prev_state = torch.zeros(
+            batch_size, self.nheads, self.headdim, self.d_state,
+            device=device, dtype=torch.float32,
+        )
         return angle_state, ssm_state, Bx_prev_state
 
     def extra_repr(self) -> str:
@@ -930,14 +936,24 @@ if __name__ == "__main__":
     assert y2.shape == x.shape, f"MIMO shape mismatch: {y2.shape} vs {x.shape}"
     print(f"  ✓ forward  output shape: {y2.shape}")
 
-    # MIMO step: ssm_state is (B, H, D) — note no headdim dim (P projected away)
+    # MIMO keeps the same persistent (B, H, P, D) state shape as SISO.
     angle_m, h_m, bx_m = model_mimo.allocate_inference_cache(2)
-    assert h_m.shape == (2, model_mimo.nheads, model_mimo.d_state), \
+    expected_mimo_state_shape = (
+        2, model_mimo.nheads, model_mimo.headdim, model_mimo.d_state
+    )
+    assert h_m.shape == expected_mimo_state_shape, \
         f"MIMO state shape mismatch: {h_m.shape}"
-    o2, angle_m, h_m, bx_m = model_mimo.step(u_single, angle_m, h_m, bx_m)
-    assert o2.shape == (2, 256), f"MIMO step shape mismatch: {o2.shape}"
-    print(f"  ✓ step     output shape: {o2.shape}")
-    print(f"  ✓ ssm_state shape (MIMO, no P-dim): {h_m.shape}")
+    assert bx_m.shape == expected_mimo_state_shape, \
+        f"MIMO previous-write shape mismatch: {bx_m.shape}"
+    step_outputs = []
+    for t in range(x.shape[1]):
+        o2, angle_m, h_m, bx_m = model_mimo.step(x[:, t], angle_m, h_m, bx_m)
+        step_outputs.append(o2)
+    y2_step = torch.stack(step_outputs, dim=1)
+    assert torch.allclose(y2, y2_step, atol=2e-6, rtol=2e-5), \
+        f"MIMO scan/step mismatch: {(y2 - y2_step).abs().max()}"
+    print(f"  ✓ step     matches full scan: {y2_step.shape}")
+    print(f"  ✓ ssm_state shape (MIMO preserves P): {h_m.shape}")
 
     print("\nAll checks passed!")
 

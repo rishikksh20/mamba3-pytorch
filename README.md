@@ -31,13 +31,13 @@ A small "angle" projection is learned per head and accumulated over time scaled 
 
 Mamba-2 is **SISO**: one input vector drives one output via one SSM state (outer-product update of shape `P×D`). During autoregressive decoding the GPU is memory-bandwidth bound, so this is inefficient.
 
-**MIMO** reuses the *same* D-dimensional SSM state for `R` rank streams simultaneously:
+**MIMO** reuses the same `P×D` SSM state for `R` rank streams simultaneously:
 
 | | SISO | MIMO |
 |---|---|---|
-| State shape | `(H, P, D)` | `(H, D)` |
-| State update | outer product `x ⊗ B` → P×D write | sum of R rank-1 scalar·D-vec terms |
-| Output | C @ h → P | R scalars up-projected via `mimo_o` |
+| State shape | `(H, P, D)` | `(H, P, D)` |
+| State update | outer product `x ⊗ B` → P×D write | rank-R matrix product → P×D write |
+| Output | C @ h → P | R P-vectors gated, then reduced via `mimo_o` |
 | FLOPs/byte ratio | low (decode bound) | R× higher |
 
 B and C projections also get rank-R counterparts (K and Q in the attention analogy).
@@ -74,7 +74,7 @@ research_notes.md  — notes taken while studying the paper
 | `build_rope_freqs` | Standard RoPE inverse-frequency schedule |
 | `apply_rope` | Rotates pairs of dimensions by given angles |
 | `mamba3_siso_scan` | Sequential SSM scan for SISO mode — clear loop over timesteps |
-| `mamba3_mimo_scan` | Sequential SSM scan for MIMO mode — shared D-dim state, R rank streams |
+| `mamba3_mimo_scan` | Sequential SSM scan for MIMO mode — shared P×D state, R rank streams |
 | `Mamba3` | Main module: input projection → SSM scan → output projection |
 | `Mamba3.step` | Single autoregressive decode step (updates states in-place) |
 | `Mamba3.allocate_inference_cache` | Allocates zero states for decoding |
@@ -125,11 +125,11 @@ y = model(x)  # same input/output shape
 ### Autoregressive decode (one token at a time)
 
 ```python
-# Allocate states — shapes differ between SISO and MIMO
+# Allocate states — SISO and MIMO keep the same persistent state shape
 angle_state, ssm_state, bx_prev = model.allocate_inference_cache(batch_size=2)
 
 # SISO  ssm_state: (B, H, P, D)
-# MIMO  ssm_state: (B, H, D)   ← no P dimension (projected away by mimo_x)
+# MIMO  ssm_state: (B, H, P, D)   ← R is transient, not cached in the state
 
 u = torch.randn(2, 256)   # single token
 out, angle_state, ssm_state, bx_prev = model.step(u, angle_state, ssm_state, bx_prev)
@@ -173,9 +173,7 @@ logits = model(input_ids)   # (1, 512, vocab_size)
 ## Implementation Notes
 
 - **No custom kernels** — everything is plain PyTorch with `einops`. The sequential scan loops are correct but `O(L)` serial; production code uses parallel chunk scans.
-- **SISO vs MIMO state shape** is the most important distinction:
-  - SISO state: `(B, H, P, D)` — headdim × d_state outer product
-  - MIMO state: `(B, H, D)` — x is first projected to R scalars via `mimo_x`, then summed into a shared D-dim state; P is completely projected away
+- **SISO and MIMO preserve the same state shape**: `(B, H, P, D)`. MIMO expands each P feature across `R` with `mimo_x`, performs a rank-R matrix write into that P×D state, and reduces `R` only after the state read and rank-wise output gate.
 - **B/C bias** (`B_bias`, `C_bias`, initialized to 1) is added *after* RMS norm and *after* group→head expansion, with shape rearranged to `(R, H, D)` for correct broadcasting.
 - **Per-head RoPE** — angle increments are `dt_h * angle_raw` independently per head, not a single mean-dt scalar shared across heads.
 - **Trapezoidal memory** (`Bx_prev`) is part of the inference state and must be carried across decode steps alongside the SSM state.
